@@ -1,0 +1,366 @@
+name: flight-booking
+
+x-service-env: &service-env
+  JWT_SECRET: ${JWT_SECRET:-dev-only-change-me-flight-booking-secret}
+  RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+  REDIS_URL: redis://redis:6379
+  LOG_LEVEL: info
+
+x-service: &service
+  restart: unless-stopped
+  networks: [backend]
+  stop_grace_period: 15s
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health/ready"]
+    interval: 5s
+    timeout: 3s
+    retries: 6
+    start_period: 10s
+
+x-main-db-deps: &main-db-deps
+  postgres-main:
+    condition: service_healthy
+  rabbitmq:
+    condition: service_healthy
+
+x-search: &search
+  <<: *service
+  build: { context: ./services, args: { SERVICE: search } }
+  image: flight-booking/search
+  environment:
+    <<: *service-env
+    DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_HOST:-postgres-main}:5432/search
+  depends_on:
+    <<: *main-db-deps
+    redis:
+      condition: service_healthy
+
+services:
+  # ---------- Gateway + frontend ----------
+  # The only entry point: serves the website (/) and the API (/api/*) on one origin.
+  kong:
+    image: kong:3.9
+    container_name: kong
+    restart: unless-stopped
+    networks: [backend]
+    ports:
+      - "8000:8000"
+    environment:
+      KONG_DATABASE: "off"
+      KONG_NGINX_WORKER_PROCESSES: "2"
+      KONG_DECLARATIVE_CONFIG: /kong/kong.yml
+      KONG_PROXY_LISTEN: 0.0.0.0:8000
+      KONG_ADMIN_LISTEN: "off"
+      KONG_STATUS_LISTEN: 0.0.0.0:8100
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      # A stopped instance loses its DNS name: keep these short so it is found again quickly.
+      KONG_DNS_VALID_TTL: "5"
+      KONG_DNS_NOT_FOUND_TTL: "2"
+      KONG_DNS_ERROR_TTL: "1"
+      KONG_DNS_STALE_TTL: "0"
+    volumes:
+      - ./kong/kong.yml:/kong/kong.yml:ro
+    depends_on:
+      search-1:
+        condition: service_healthy
+      search-2:
+        condition: service_healthy
+      booking:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Static files only, reachable through Kong; no port is published.
+  frontend:
+    build: ./frontend
+    image: flight-booking/frontend
+    container_name: frontend
+    restart: unless-stopped
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+
+  # ---------- Services ----------
+  auth:
+    <<: *service
+    build: { context: ./services, args: { SERVICE: auth } }
+    image: flight-booking/auth
+    container_name: auth
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_HOST:-postgres-main}:5432/auth
+    depends_on: *main-db-deps
+
+  flight:
+    <<: *service
+    build: { context: ./services, args: { SERVICE: flight } }
+    image: flight-booking/flight
+    container_name: flight
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_HOST:-postgres-main}:5432/flight
+    depends_on: *main-db-deps
+
+  search-1:
+    <<: *search
+    container_name: search-1
+
+  search-2:
+    <<: *search
+    container_name: search-2
+
+  booking:
+    <<: *service
+    build: { context: ./services, args: { SERVICE: booking } }
+    image: flight-booking/booking
+    container_name: booking
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_HOST:-postgres-main}:5432/booking
+      FLIGHT_URL: http://flight:3000
+    depends_on:
+      <<: *main-db-deps
+      redis:
+        condition: service_healthy
+
+  payment:
+    <<: *service
+    build: { context: ./services, args: { SERVICE: payment } }
+    image: flight-booking/payment
+    container_name: payment
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_HOST:-postgres-main}:5432/payment
+      GATEWAY_FAIL_RATE: ${GATEWAY_FAIL_RATE:-0}
+    depends_on: *main-db-deps
+
+  notification:
+    <<: *service
+    build: { context: ./services, args: { SERVICE: notification } }
+    image: flight-booking/notification
+    container_name: notification
+    environment:
+      <<: *service-env
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_HOST:-postgres-main}:5432/notification
+      MAIL_RELAY_HOST: ${MAIL_RELAY_HOST:-}
+      MAIL_RELAY_PORT: ${MAIL_RELAY_PORT:-587}
+      MAIL_RELAY_USER: ${MAIL_RELAY_USER:-}
+      MAIL_RELAY_PASS: ${MAIL_RELAY_PASS:-}
+    depends_on: *main-db-deps
+
+  # ---------- Data ----------
+  postgres-main:
+    image: postgres:16-alpine
+    container_name: postgres-main
+    restart: unless-stopped
+    networks: [backend]
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=5
+      - -c
+      - max_replication_slots=5
+      # 7 service processes with up to 20 connections each, plus exporters and backup.
+      # The replica must use at least the same value (db/replica/start-replica.sh).
+      - -c
+      - max_connections=200
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      REPLICATOR_PASSWORD: ${REPLICATOR_PASSWORD:-replicator}
+    volumes:
+      - postgres-main-data:/var/lib/postgresql/data
+      - ./db/main:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d notification"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  postgres-replica:
+    image: postgres:16-alpine
+    container_name: postgres-replica
+    restart: unless-stopped
+    networks: [backend]
+    entrypoint: ["/bin/sh", "/replica/start-replica.sh"]
+    environment:
+      PRIMARY_HOST: postgres-main
+      REPLICATOR_PASSWORD: ${REPLICATOR_PASSWORD:-replicator}
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - postgres-replica-data:/var/lib/postgresql/data
+      - ./db/replica:/replica:ro
+    depends_on:
+      postgres-main:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: rabbitmq
+    restart: unless-stopped
+    networks: [backend]
+    ports:
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  # ---------- Backup ----------
+  backup:
+    image: postgres:16-alpine
+    container_name: backup
+    restart: unless-stopped
+    networks: [backend]
+    # Daily at 00:00 Vietnam time. TZ also sets the time used in backup folder names.
+    entrypoint: ["/bin/sh", "-c", "echo '0 0 * * * /bin/sh /scripts/backup.sh >> /proc/1/fd/1 2>&1' | crontab - && exec crond -f -l 8"]
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      TZ: Asia/Ho_Chi_Minh
+      # Where restore.sh writes: the current primary.
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres-main}
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./backups:/backups
+    # backup.sh prefers the replica but falls back to the primary, so only the primary is required.
+    depends_on:
+      postgres-main:
+        condition: service_healthy
+
+  # ---------- Monitoring ----------
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: prometheus
+    restart: unless-stopped
+    networks: [backend]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    container_name: grafana
+    restart: unless-stopped
+    networks: [backend]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_DEFAULT_LANGUAGE: vi-VN
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+
+  loki:
+    image: grafana/loki:3.5.3
+    container_name: loki
+    restart: unless-stopped
+    networks: [backend]
+    volumes:
+      - loki-data:/loki
+
+  alloy:
+    image: grafana/alloy:v1.10.2
+    container_name: alloy
+    restart: unless-stopped
+    networks: [backend]
+    command: ["run", "--storage.path=/var/lib/alloy/data", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./monitoring/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+
+  postgres-exporter-main:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    container_name: postgres-exporter-main
+    restart: unless-stopped
+    networks: [backend]
+    environment:
+      DATA_SOURCE_NAME: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@postgres-main:5432/postgres?sslmode=disable
+
+  postgres-exporter-replica:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    container_name: postgres-exporter-replica
+    restart: unless-stopped
+    networks: [backend]
+    environment:
+      DATA_SOURCE_NAME: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@postgres-replica:5432/postgres?sslmode=disable
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.74.0-alpine
+    container_name: redis-exporter
+    restart: unless-stopped
+    networks: [backend]
+    environment:
+      REDIS_ADDR: redis://redis:6379
+
+  cadvisor:
+    image: ghcr.io/google/cadvisor:v0.60.6
+    container_name: cadvisor
+    restart: unless-stopped
+    networks: [backend]
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    command: ["--docker_only=true", "--housekeeping_interval=10s"]
+
+  # ---------- Load test: docker compose run --rm k6 run /scripts/seat-race.js ----------
+  k6:
+    image: grafana/k6:1.2.2
+    profiles: [tools]
+    networks: [backend]
+    volumes:
+      - ./k6:/scripts:ro
+    environment:
+      BASE_URL: http://kong:8000
+
+networks:
+  backend:
+
+volumes:
+  postgres-main-data:
+  postgres-replica-data:
+  rabbitmq-data:
+  prometheus-data:
+  grafana-data:
+  loki-data:

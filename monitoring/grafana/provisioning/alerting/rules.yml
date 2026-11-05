@@ -1,0 +1,149 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: flight-booking
+    folder: Flight Booking
+    interval: 30s
+    rules:
+      - uid: instance-down
+        title: Instance chết
+        condition: B
+        for: 1m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: Prometheus không lấy được metric của một instance trong 1 phút
+        data:
+          - &query
+            refId: A
+            datasourceUid: prometheus
+            relativeTimeRange: { from: 300, to: 0 }
+            model:
+              refId: A
+              instant: true
+              expr: count(up{job=~"services|kong"} == 0) or vector(0)
+          - &threshold
+            refId: B
+            datasourceUid: __expr__
+            relativeTimeRange: { from: 0, to: 0 }
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+
+      - uid: high-error-rate
+        title: Tỷ lệ lỗi cao
+        condition: B
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: Tỷ lệ lỗi 5xx trên 5% trong 5 phút
+        data:
+          - <<: *query
+            model:
+              refId: A
+              instant: true
+              expr: >-
+                sum(rate(http_request_duration_seconds_count{status=~"5.."}[1m]))
+                / sum(rate(http_request_duration_seconds_count[1m]))
+          - <<: *threshold
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0.05] }
+
+      - uid: high-latency
+        title: Hệ thống chậm
+        condition: B
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: Độ trễ p95 trên 1 giây trong 5 phút
+        data:
+          - <<: *query
+            model:
+              refId: A
+              instant: true
+              expr: histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{route!="unmatched"}[1m])))
+          - <<: *threshold
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [1] }
+
+      - uid: events-stuck
+        title: Event bị tắc
+        condition: B
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: Outbox hoặc queue tăng liên tục trong 5 phút
+        data:
+          - <<: *query
+            model:
+              refId: A
+              instant: true
+              expr: >-
+                deriv((sum(outbox_pending_events)
+                + sum(rabbitmq_queue_messages{queue=~".+\\.events"}))[5m:30s])
+          - <<: *threshold
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+
+      - uid: dead-letter-messages
+        title: Có message lỗi
+        condition: B
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: Dead letter queue có message
+        data:
+          - <<: *query
+            model:
+              refId: A
+              instant: true
+              expr: sum(rabbitmq_queue_messages{queue=~".+\\.dlq"})
+          - <<: *threshold
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+
+      - uid: replica-lag
+        title: Replica chậm
+        condition: B
+        for: 1m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: Độ trễ replication trên 30 giây
+        data:
+          - <<: *query
+            model:
+              refId: A
+              instant: true
+              expr: max(pg_replication_lag_seconds{instance="postgres-exporter-replica:9187"})
+          - <<: *threshold
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [30] }

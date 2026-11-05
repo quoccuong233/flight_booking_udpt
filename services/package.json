@@ -1,0 +1,13 @@
+{
+  "name": "flight-booking-services",
+  "private": true,
+  "workspaces": [
+    "common",
+    "auth",
+    "flight",
+    "search",
+    "booking",
+    "payment",
+    "notification"
+  ]
+}

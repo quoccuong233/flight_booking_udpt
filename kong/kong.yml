@@ -1,0 +1,138 @@
+_format_version: "3.0"
+_transform: true
+
+# Health checks let Kong answer 503 in milliseconds once it has marked an instance down.
+# Without an upstream every request to a stopped service waits about 12 seconds on DNS,
+# so Booking keeps one even with a single instance.
+upstreams:
+  - name: booking-upstream
+    algorithm: round-robin
+    targets:
+      - target: booking:3000
+    healthchecks:
+      active:
+        type: http
+        http_path: /health/ready
+        healthy: { interval: 5, successes: 2 }
+        unhealthy: { interval: 2, http_failures: 2, tcp_failures: 2, timeouts: 2 }
+      passive:
+        # 500 only: a 503 means a dependency is down, not this instance.
+        unhealthy: { http_statuses: [500], http_failures: 3, tcp_failures: 2, timeouts: 3 }
+
+  - name: search-upstream
+    algorithm: round-robin
+    targets:
+      - target: search-1:3000
+      - target: search-2:3000
+    healthchecks:
+      active:
+        type: http
+        http_path: /health/ready
+        healthy: { interval: 5, successes: 2 }
+        unhealthy: { interval: 2, http_failures: 2, tcp_failures: 2, timeouts: 2 }
+      passive:
+        # 500 only: a 503 means a dependency is down, not this instance.
+        unhealthy: { http_statuses: [500], http_failures: 3, tcp_failures: 2, timeouts: 3 }
+
+services:
+  # The web app. Kong ranks routes by how many fields they match before path length,
+  # so this route must stay path-only: adding `methods` would make it beat every
+  # path-only /api route below for GET requests.
+  - name: frontend-service
+    host: frontend
+    port: 8080
+    connect_timeout: 2000
+    read_timeout: 10000
+    routes:
+      - name: frontend-routes
+        paths: [/]
+        strip_path: false
+
+  - name: auth-service
+    host: auth
+    port: 3000
+    connect_timeout: 2000
+    read_timeout: 10000
+    routes:
+      - name: auth-routes
+        paths: [/api/auth]
+        strip_path: false
+
+  - name: flight-service
+    host: flight
+    port: 3000
+    connect_timeout: 2000
+    read_timeout: 10000
+    routes:
+      - name: flight-public
+        paths: [/api/flights]
+        methods: [GET]
+        strip_path: false
+      - name: flight-admin
+        paths: [/api/flights]
+        methods: [POST, PATCH]
+        strip_path: false
+        plugins:
+          - name: jwt
+            config: { claims_to_verify: [exp] }
+
+  - name: search-service
+    host: search-upstream
+    port: 3000
+    retries: 2
+    connect_timeout: 2000
+    read_timeout: 10000
+    routes:
+      - name: search-routes
+        paths: [/api/search]
+        strip_path: false
+
+  - name: booking-service
+    host: booking-upstream
+    port: 3000
+    retries: 1 # safe because POST /api/bookings is idempotent
+    connect_timeout: 2000
+    read_timeout: 10000
+    routes:
+      - name: booking-routes
+        paths: [/api/bookings]
+        strip_path: false
+        plugins:
+          - name: jwt
+            config: { claims_to_verify: [exp] }
+
+  - name: payment-service
+    host: payment
+    port: 3000
+    connect_timeout: 2000
+    read_timeout: 10000
+    routes:
+      - name: payment-routes
+        paths: [/api/payments]
+        strip_path: false
+        plugins:
+          - name: jwt
+            config: { claims_to_verify: [exp] }
+
+consumers:
+  - username: flight-booking-app
+    jwt_secrets:
+      - key: flight-booking # must equal the `iss` claim issued by Auth
+        algorithm: HS256
+        secret: dev-only-change-me-flight-booking-secret # must equal JWT_SECRET
+
+plugins:
+  - name: prometheus
+    config:
+      status_code_metrics: true
+      latency_metrics: true
+      upstream_health_metrics: true
+  - name: correlation-id
+    config:
+      header_name: X-Correlation-ID
+      generator: uuid
+      echo_downstream: true
+  - name: rate-limiting
+    config:
+      minute: 6000
+      policy: local

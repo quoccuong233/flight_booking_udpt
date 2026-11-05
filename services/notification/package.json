@@ -1,0 +1,10 @@
+{
+  "name": "notification",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/index.js",
+  "dependencies": {
+    "@flight/common": "1.0.0",
+    "nodemailer": "^7.0.6"
+  }
+}
