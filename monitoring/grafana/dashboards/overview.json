@@ -734,7 +734,16 @@
         {
           "refId": "A",
           "expr": "pg_replication_lag_seconds{instance=\"postgres-exporter-replica:9187\"}",
-          "legendFormat": "replica",
+          "legendFormat": "postgres-replica",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "pg_replication_lag_seconds{instance=\"postgres-exporter-booking-replica:9187\"}",
+          "legendFormat": "postgres-booking-replica",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"

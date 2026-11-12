@@ -16,6 +16,7 @@ và chạy toàn bộ bằng Docker Compose.
 - [Demo chịu lỗi](#demo-chịu-lỗi)
 - [Giám sát](#giám-sát)
 - [Gửi email thật](#gửi-email-thật)
+- [Thanh toán qua VNPay sandbox](#thanh-toán-qua-vnpay-sandbox)
 - [Sao lưu, khôi phục và failover](#sao-lưu-khôi-phục-và-failover)
 - [Cấu trúc thư mục](#cấu-trúc-thư-mục)
 - [Phát triển frontend](#phát-triển-frontend)
@@ -35,7 +36,10 @@ Trình duyệt ──► Kong :8000 ─┬─ /            ──► frontend (n
 
 auth, flight, booking, payment ──outbox──► RabbitMQ (exchange "events") ──► search, booking,
                                                                             payment, notification
-Mỗi service có database riêng trên postgres-main ──streaming replication──► postgres-replica
+auth, flight, search, payment, notification: mỗi service một database trên
+    postgres-main    ──streaming replication──► postgres-replica
+booking: instance riêng
+    postgres-booking ──streaming replication──► postgres-booking-replica
 ```
 
 | Service | Trách nhiệm | Database | Dùng thêm |
@@ -43,8 +47,8 @@ Mỗi service có database riêng trên postgres-main ──streaming replicatio
 | `auth` | Đăng ký, đăng nhập, hồ sơ, ảnh đại diện, đổi mật khẩu, cấp JWT | `auth` | |
 | `flight` | Chuyến bay, giá, dữ liệu mẫu 30 ngày | `flight` | |
 | `search` (x2) | Tìm kiếm và gợi ý chuyến trên read model (CQRS) | `search` | Redis (cache 15 giây) |
-| `booking` | Giữ ghế, chống bán trùng, saga, job hủy vé quá hạn | `booking` | Redis (khóa ghế), gọi `flight` |
-| `payment` | Thanh toán giả lập, hoàn tiền | `payment` | |
+| `booking` | Giữ ghế, chống bán trùng, saga, job hủy vé quá hạn | `booking` (instance riêng `postgres-booking`) | Redis (khóa ghế), gọi `flight` |
+| `payment` | Thanh toán qua VNPay sandbox (hoặc giả lập khi chưa cấu hình), hoàn tiền | `payment` | VNPay (tùy chọn) |
 | `notification` | Gửi email khi có event | `notification` | SMTP (tùy chọn) |
 
 Các cơ chế chính:
@@ -69,7 +73,7 @@ Các cơ chế chính:
 | Frontend | React 19, React Router 7, Vite 7, phục vụ bằng nginx 1.27 |
 | API Gateway | Kong 3.9 (DB-less, cấu hình khai báo) |
 | Service | Node.js 22, Express 5, pg, amqplib, redis, opossum, pino, prom-client |
-| Dữ liệu | PostgreSQL 16 (primary và replica), Redis 7, RabbitMQ 3.13 |
+| Dữ liệu | PostgreSQL 16 (2 instance, mỗi instance có primary và replica), Redis 7, RabbitMQ 3.13 |
 | Giám sát | Prometheus, Grafana, Loki, Alloy, cAdvisor, các exporter cho Postgres và Redis |
 | Kiểm thử | `node --test` (end-to-end), k6 (tải) |
 
@@ -103,8 +107,9 @@ docker compose ps
 
 Tài khoản quản trị dùng để gọi API tạo và sửa chuyến bay: `admin@flight.local` / `admin123`.
 
-Thanh toán là giả lập: bấm thanh toán trên website luôn thành công. Muốn thử nhánh thất bại, gọi
-`POST /api/payments` với `cardNumber` có 4 số cuối là `0000`.
+Khi chưa cấu hình VNPay, thanh toán là giả lập: bấm thanh toán trên website luôn thành công. Muốn
+thử nhánh thất bại, gọi `POST /api/payments` với `cardNumber` có 4 số cuối là `0000`. Muốn thanh toán
+qua trang VNPay, xem [Thanh toán qua VNPay sandbox](#thanh-toán-qua-vnpay-sandbox).
 
 Dừng hệ thống:
 
@@ -125,6 +130,8 @@ docker compose down -v     # xóa luôn dữ liệu trong các volume
 | `GRAFANA_PASSWORD` | `admin` | Mật khẩu `admin` của Grafana |
 | `JWT_SECRET` | `dev-only-change-me-...` | Khóa ký JWT. **Đổi biến này thì phải đổi cả `consumers.jwt_secrets.secret` trong [kong/kong.yml](kong/kong.yml)**, nếu không mọi route cần đăng nhập sẽ trả `401`. |
 | `GATEWAY_FAIL_RATE` | `0` | Tỉ lệ từ 0 đến 1 các lần gọi cổng thanh toán giả lập bị lỗi |
+| `VNPAY_TMN_CODE`, `VNPAY_HASH_SECRET` | (trống) | Terminal VNPay sandbox. Thiếu một trong hai thì dùng cổng giả lập. |
+| `VNPAY_RETURN_URL` | `http://localhost:8000/payment/vnpay-return` | Địa chỉ VNPay đưa trình duyệt quay về sau khi thanh toán |
 | `MAIL_RELAY_HOST` | (trống) | Máy chủ SMTP. Để trống thì không gửi email. |
 | `MAIL_RELAY_PORT` | `587` | Cổng SMTP |
 | `MAIL_RELAY_USER`, `MAIL_RELAY_PASS` | (trống) | Tài khoản SMTP |
@@ -153,7 +160,9 @@ Mọi API đi qua Kong tại `http://localhost:8000`. Route có đánh dấu JWT
 | `GET` | `/api/bookings` | Có | Danh sách vé của tôi |
 | `GET` | `/api/bookings/:id` | Có | Chi tiết vé |
 | `GET` | `/api/bookings/flights/:flightId/seats` | Có | Sơ đồ ghế của chuyến bay |
-| `POST` | `/api/payments` | Có | Thanh toán cho một booking |
+| `POST` | `/api/payments` | Có | Thanh toán cho một booking. Khi dùng VNPay, trả `{ payUrl }` để chuyển trình duyệt sang VNPay. |
+| `GET` | `/api/payments/vnpay/return` | | VNPay đưa trình duyệt về đây; kiểm tra chữ ký rồi ghi kết quả |
+| `GET` | `/api/payments/vnpay/ipn` | | VNPay gọi trực tiếp để báo kết quả (cần địa chỉ public) |
 | `GET` | `/api/payments/:bookingId` | Có | Trạng thái thanh toán |
 
 Mỗi service còn có `/health/live`, `/health/ready` và `/metrics`. Các endpoint này chỉ truy cập được
@@ -246,10 +255,53 @@ Lưu ý:
   vé vẫn thành công.
 - Hệ thống chưa xác minh email, nên ai cũng có thể đăng ký bằng địa chỉ của người khác.
 
+## Thanh toán qua VNPay sandbox
+
+Cần một terminal test đã được VNPay duyệt. Đăng ký tại https://pay.vnpaytest.vn/dev-registration,
+VNPay gửi email chứa `vnp_TmnCode` và `vnp_HashSecret`.
+
+1. Điền vào `.env`:
+
+   ```env
+   VNPAY_TMN_CODE=<mã terminal>
+   VNPAY_HASH_SECRET=<chuỗi bí mật>
+   ```
+
+2. Khởi động lại Payment: `docker compose up -d --no-deps payment`. Log có dòng
+   `"provider":"vnpay"` là đã bật.
+3. Đặt vé, bấm **Thanh toán**, website chuyển sang trang VNPay. Chọn thẻ nội địa, ngân hàng NCB, nhập
+   thẻ test:
+
+   | Trường | Giá trị |
+   | --- | --- |
+   | Số thẻ | `9704198526191432198` |
+   | Tên chủ thẻ | `NGUYEN VAN A` |
+   | Ngày phát hành | `07/15` |
+   | OTP | `123456` |
+
+Luồng xử lý:
+
+```text
+Checkout ─POST /api/payments─► Payment tạo URL có chữ ký HMAC-SHA512 ─► trình duyệt sang VNPay
+VNPay ─► /payment/vnpay-return ─► GET /api/payments/vnpay/return ─► Payment kiểm tra chữ ký và số
+tiền ─► payments = SUCCEEDED + event payment.succeeded ─► Booking xác nhận vé (saga như cũ)
+```
+
+- Bấm **Hủy** hoặc thanh toán lỗi trên VNPay thì vé vẫn `PENDING`, có thể thanh toán lại cho tới khi
+  hết 10 phút giữ ghế.
+- Kết quả từ return và IPN được ghi đúng một lần dù tới bao nhiêu lần, theo thứ tự nào.
+- IPN (`/api/payments/vnpay/ipn`) chỉ chạy khi VNPay gọi được tới máy bạn qua địa chỉ public. Chạy ở
+  `localhost` thì kết quả được ghi qua trang return, nên chỉ cần trình duyệt quay về được.
+- Hoàn tiền vẫn chỉ đổi trạng thái thành `REFUNDED` trong database, không gọi API hoàn tiền của VNPay.
+- Nếu VNPay báo lỗi `71` (website chưa được phê duyệt) hoặc `88` (điểm thanh toán chưa được cấu hình),
+  terminal chưa được kích hoạt. Liên hệ hotrovnpay@vnpay.vn.
+
 ## Sao lưu, khôi phục và failover
 
 Container `backup` chạy `pg_dump` lúc 00:00 (giờ Việt Nam) hằng ngày và giữ 7 bản gần nhất trong
-`backups/`. Docker phải đang chạy vào lúc đó; lần nào bị lỡ sẽ không được chạy bù.
+`backups/`. Docker phải đang chạy vào lúc đó; lần nào bị lỡ sẽ không được chạy bù. Mỗi instance được
+dump từ bản sao của nó (`postgres-replica`, `postgres-booking-replica`); bản sao không chạy thì dump
+từ database chính. `restore.sh` tự chọn instance theo tên database.
 
 ```bash
 # Sao lưu ngay
@@ -261,29 +313,51 @@ docker compose exec backup sh /scripts/restore.sh 20261031-020000 booking
 
 ### Failover và failback
 
-Bình thường `postgres-main` là database chính, `postgres-replica` là bản sao. Việc chuyển đổi làm
-bằng tay qua 2 script PowerShell:
+Có 2 instance PostgreSQL, mỗi instance có một bản sao và failover độc lập với nhau:
+
+| `-Cluster` | Database chính | Bản sao | Biến trong `.env` | Service dùng |
+| --- | --- | --- | --- | --- |
+| `main` (mặc định) | `postgres-main` | `postgres-replica` | `POSTGRES_HOST` | auth, flight, search, payment, notification |
+| `booking` | `postgres-booking` | `postgres-booking-replica` | `BOOKING_DB_HOST` | booking |
+
+Việc chuyển đổi làm bằng tay qua 2 script PowerShell:
 
 ```powershell
-# postgres-main chết hoặc cần tắt: chuyển hệ thống sang replica (khoảng 20 giây)
+# postgres-main chết hoặc cần tắt: chuyển sang postgres-replica (khoảng 20 giây)
 powershell -ExecutionPolicy Bypass -File scripts\failover.ps1
 
-# Đưa postgres-main về làm chính, dựng lại replica làm bản sao (khoảng 1 phút)
+# postgres-booking chết: chỉ chuyển booking sang postgres-booking-replica
+powershell -ExecutionPolicy Bypass -File scripts\failover.ps1 -Cluster booking
+
+# Đưa database chính về, dựng lại bản sao (khoảng 1 phút). Dùng cùng -Cluster như lúc failover.
 powershell -ExecutionPolicy Bypass -File scripts\failback.ps1
+powershell -ExecutionPolicy Bypass -File scripts\failback.ps1 -Cluster booking
 ```
 
 | Script | Các bước |
 | --- | --- |
-| `failover.ps1` | Dừng service và `postgres-main`, promote replica, ghi `POSTGRES_HOST=postgres-replica` vào `.env`, khởi động lại service và chờ Kong chuyển request được |
-| `failback.ps1` | Dừng service, sao lưu dữ liệu mới nhất từ replica, khôi phục vào `postgres-main`, xóa và dựng lại replica từ main, bỏ `POSTGRES_HOST` khỏi `.env`, khởi động lại service |
+| `failover.ps1` | Dừng các service của instance đó và database chính, promote bản sao, ghi biến host (ví dụ `POSTGRES_HOST=postgres-replica`) vào `.env`, khởi động lại service và chờ Kong chuyển request được |
+| `failback.ps1` | Dừng service, sao lưu dữ liệu mới nhất từ bản sao, khôi phục vào database chính, xóa và dựng lại bản sao, bỏ biến host khỏi `.env`, khởi động lại service |
 
-Sau failover, hệ thống không tự quay về `postgres-main` khi nó sống lại, vì dữ liệu của main đã cũ:
-các vé đặt trong lúc chạy trên replica chỉ nằm ở replica. Trong thời gian này không còn bản sao dự
+Sau failover, hệ thống không tự quay về database chính khi nó sống lại, vì dữ liệu của nó đã cũ:
+dữ liệu ghi trong lúc chạy trên bản sao chỉ nằm ở bản sao. Trong thời gian này không còn bản sao dự
 phòng. Chạy `failback.ps1` để chép dữ liệu mới về main và có lại bản sao.
 
-Đang ở trạng thái failover thì không xóa dòng `POSTGRES_HOST` trong `.env` bằng tay, nếu không các
-service sẽ quay về dữ liệu cũ của `postgres-main`. Mỗi lần failback tạo thêm một bản sao lưu, tính
+Đang ở trạng thái failover thì không xóa dòng `POSTGRES_HOST` hay `BOOKING_DB_HOST` trong `.env` bằng
+tay, nếu không các service sẽ quay về dữ liệu cũ. Mỗi lần failback tạo thêm một bản sao lưu, tính
 vào giới hạn 7 bản.
+
+### Chuyển booking sang instance riêng (chạy một lần)
+
+Trước đây database `booking` nằm chung `postgres-main`. Nếu volume `postgres-main-data` được tạo từ hồi
+đó, chạy script dưới đây thay cho `docker compose up -d` để chép dữ liệu sang `postgres-booking`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\migrate-booking-db.ps1
+```
+
+Script dừng booking, chép database, so số vé và số ghế hai bên, rồi đổi tên database cũ trên
+`postgres-main` thành `booking_before_split` (không xóa). Cài mới từ đầu thì không cần chạy.
 
 ## Cấu trúc thư mục
 
@@ -303,7 +377,8 @@ vào giới hạn 7 bản.
 │   └── notification/
 ├── frontend/              React + Vite, build thành file tĩnh và phục vụ bằng nginx
 ├── db/
-│   ├── main/              Schema 6 database và cấu hình replication
+│   ├── main/              Schema 5 database trên postgres-main và cấu hình replication
+│   ├── booking/           Schema database booking trên postgres-booking và cấu hình replication
 │   └── replica/           Script khởi động replica
 ├── monitoring/            Cấu hình Prometheus, Grafana, Alloy
 ├── scripts/               Sao lưu, khôi phục, failover, failback, cấu hình email
@@ -327,8 +402,9 @@ npm run dev
 
 - Kong, Redis, RabbitMQ và Booking chỉ chạy 1 instance. Kong chết thì toàn hệ thống dừng; Booking
   chết thì không đặt được vé.
-- Cả 6 database nằm chung container `postgres-main`. Container này chết thì mọi service dừng cho tới
-  khi failover xong.
+- 5 database nằm chung container `postgres-main`. Container này chết thì auth, flight, search, payment,
+  notification dừng cho tới khi failover xong. Booking có instance riêng nhưng vẫn không đặt được vé
+  mới vì phải gọi sang flight; xem lại vé cũ thì vẫn được.
 - Failover database chạy bằng script nhưng phải tự gọi, không tự động khi main chết. Chưa có auto-scaling.
 - Chỉ chạy HTTP vì là môi trường local. Muốn dùng HTTPS cần thêm chứng chỉ cho Kong.
 - Sau khi rebuild một service, Kong có thể trả `503` trong vài giây cho tới khi phân giải được IP mới.

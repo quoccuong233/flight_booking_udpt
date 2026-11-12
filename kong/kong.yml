@@ -113,6 +113,12 @@ services:
         plugins:
           - name: jwt
             config: { claims_to_verify: [exp] }
+      # VNPay's return and IPN calls carry no token; Payment checks VNPay's signature instead.
+      # The extra `methods` field makes this route win over payment-routes.
+      - name: payment-vnpay-public
+        paths: [/api/payments/vnpay]
+        methods: [GET]
+        strip_path: false
 
 consumers:
   - username: flight-booking-app

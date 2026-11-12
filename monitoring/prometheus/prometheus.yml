@@ -28,6 +28,8 @@ scrape_configs:
       - targets:
           - postgres-exporter-main:9187
           - postgres-exporter-replica:9187
+          - postgres-exporter-booking:9187
+          - postgres-exporter-booking-replica:9187
 
   - job_name: redis
     static_configs:

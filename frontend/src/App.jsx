@@ -10,6 +10,7 @@ import CheckoutPage from './pages/CheckoutPage.jsx';
 import LoginPage from './pages/LoginPage.jsx';
 import SearchPage from './pages/SearchPage.jsx';
 import SeatsPage from './pages/SeatsPage.jsx';
+import VnpayReturnPage from './pages/VnpayReturnPage.jsx';
 
 function RequireAuth({ children }) {
   const { user } = useAuth();
@@ -63,6 +64,9 @@ export default function App() {
               path="/bookings/:bookingId/pay"
               element={<RequireAuth><CheckoutPage /></RequireAuth>}
             />
+            {/* No RequireAuth: it would drop VNPay's query string. VNPay's signature is checked
+                server side, and the checkout page it leads to asks for a login. */}
+            <Route path="/payment/vnpay-return" element={<VnpayReturnPage />} />
             <Route path="/bookings" element={<RequireAuth><BookingsPage /></RequireAuth>} />
             <Route path="/account" element={<RequireAuth><AccountPage /></RequireAuth>} />
           </Route>

@@ -164,12 +164,12 @@ function PasswordForm() {
   );
 }
 
-export default function AccountPage() {
-  const [profile, setProfile] = useState(null);
+// Ticket stats and the next trip come from the booking service. They load on their own so the
+// profile (auth service) still shows when booking is down, and the other way round.
+function BookingSummary() {
   const [bookings, setBookings] = useState(null);
   const [error, setError] = useState('');
-  const fileInput = useRef(null);
-  const avatar = useAvatarUpload(setProfile);
+  const [loading, setLoading] = useState(true);
 
   const confirmed = bookings?.filter((booking) => booking.status === 'CONFIRMED') ?? [];
   const flights = useFlights(confirmed.map((booking) => booking.flightId));
@@ -177,26 +177,86 @@ export default function AccountPage() {
     .filter((booking) => new Date(flights[booking.flightId]?.departAt) > new Date())
     .sort((a, b) => new Date(flights[a.flightId].departAt) - new Date(flights[b.flightId].departAt))[0];
 
+  const load = () => {
+    setLoading(true);
+    setError('');
+    api('/bookings')
+      .then((result) => setBookings(result.bookings))
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(load, []);
+
+  if (error) {
+    return (
+      <div className="panel">
+        <p className="alert alert-bad" role="alert">Không tải được thông tin vé: {error}</p>
+        <button type="button" className="button" onClick={load} disabled={loading}>
+          {loading ? 'Đang thử lại...' : 'Thử lại'}
+        </button>
+      </div>
+    );
+  }
+  if (!bookings) return <p className="muted">Đang tải thông tin vé...</p>;
+
+  const pending = bookings.filter((booking) => booking.status === 'PENDING').length;
+  const spent = confirmed.reduce((total, booking) => total + booking.amount, 0);
+
+  return (
+    <>
+      <dl className="stats">
+        <div>
+          <dt>Vé đã xác nhận</dt>
+          <dd>{confirmed.length}</dd>
+        </div>
+        <div>
+          <dt>Chờ thanh toán</dt>
+          <dd>{pending}</dd>
+        </div>
+        <div>
+          <dt>Tổng đã chi</dt>
+          <dd>{formatMoney(spent)}</dd>
+        </div>
+      </dl>
+
+      <div className="section">
+        <div className="section-head">
+          <h2>Chuyến sắp tới</h2>
+        </div>
+        {nextTrip
+          ? <Ticket booking={nextTrip} flight={flights[nextTrip.flightId]} />
+          : (
+            <div className="empty">
+              <p>Bạn chưa có chuyến bay nào sắp tới.</p>
+              <Link className="button" to="/">Tìm chuyến bay</Link>
+            </div>
+          )}
+      </div>
+    </>
+  );
+}
+
+export default function AccountPage() {
+  const [profile, setProfile] = useState(null);
+  const [error, setError] = useState('');
+  const fileInput = useRef(null);
+  const avatar = useAvatarUpload(setProfile);
+
   useEffect(() => {
-    Promise.all([api('/auth/me'), api('/bookings')])
-      .then(([me, result]) => {
-        setProfile(me.user);
-        setBookings(result.bookings);
-      })
+    api('/auth/me')
+      .then((me) => setProfile(me.user))
       .catch((err) => setError(err.message));
   }, []);
 
   if (error) return <p className="alert alert-bad" role="alert">{error}</p>;
-  if (!profile || !bookings) return <p className="muted">Đang tải...</p>;
+  if (!profile) return <p className="muted">Đang tải...</p>;
 
   const chooseFile = (event) => {
     const file = event.target.files[0];
     event.target.value = ''; // lets the same file be picked again
     if (file) avatar.upload(file);
   };
-
-  const pending = bookings.filter((booking) => booking.status === 'PENDING').length;
-  const spent = confirmed.reduce((total, booking) => total + booking.amount, 0);
 
   return (
     <section className="account">
@@ -239,34 +299,7 @@ export default function AccountPage() {
       </div>
       {avatar.error && <p className="alert alert-bad" role="alert">{avatar.error}</p>}
 
-      <dl className="stats">
-        <div>
-          <dt>Vé đã xác nhận</dt>
-          <dd>{confirmed.length}</dd>
-        </div>
-        <div>
-          <dt>Chờ thanh toán</dt>
-          <dd>{pending}</dd>
-        </div>
-        <div>
-          <dt>Tổng đã chi</dt>
-          <dd>{formatMoney(spent)}</dd>
-        </div>
-      </dl>
-
-      <div className="section">
-        <div className="section-head">
-          <h2>Chuyến sắp tới</h2>
-        </div>
-        {nextTrip
-          ? <Ticket booking={nextTrip} flight={flights[nextTrip.flightId]} />
-          : (
-            <div className="empty">
-              <p>Bạn chưa có chuyến bay nào sắp tới.</p>
-              <Link className="button" to="/">Tìm chuyến bay</Link>
-            </div>
-          )}
-      </div>
+      <BookingSummary />
 
       <div className="account-forms">
         <ProfileForm profile={profile} onSaved={setProfile} />

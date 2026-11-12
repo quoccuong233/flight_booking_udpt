@@ -125,10 +125,14 @@ services:
     container_name: booking
     environment:
       <<: *service-env
-      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_HOST:-postgres-main}:5432/booking
+      # Its own instance, not postgres-main. scripts/failover.ps1 -Cluster booking sets BOOKING_DB_HOST.
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@${BOOKING_DB_HOST:-postgres-booking}:5432/booking
       FLIGHT_URL: http://flight:3000
     depends_on:
-      <<: *main-db-deps
+      postgres-booking:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
       redis:
         condition: service_healthy
 
@@ -141,6 +145,11 @@ services:
       <<: *service-env
       DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_HOST:-postgres-main}:5432/payment
       GATEWAY_FAIL_RATE: ${GATEWAY_FAIL_RATE:-0}
+      # Both set: checkout goes through VNPay. Either empty: the simulated gateway.
+      VNPAY_TMN_CODE: ${VNPAY_TMN_CODE:-}
+      VNPAY_HASH_SECRET: ${VNPAY_HASH_SECRET:-}
+      VNPAY_URL: ${VNPAY_URL:-https://sandbox.vnpayment.vn/paymentv2/vpcpay.html}
+      VNPAY_RETURN_URL: ${VNPAY_RETURN_URL:-http://localhost:8000/payment/vnpay-return}
     depends_on: *main-db-deps
 
   notification:
@@ -171,7 +180,7 @@ services:
       - max_wal_senders=5
       - -c
       - max_replication_slots=5
-      # 7 service processes with up to 20 connections each, plus exporters and backup.
+      # 6 service processes with up to 20 connections each, plus exporters and backup.
       # The replica must use at least the same value (db/replica/start-replica.sh).
       - -c
       - max_connections=200
@@ -202,6 +211,58 @@ services:
       - ./db/replica:/replica:ro
     depends_on:
       postgres-main:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Booking has the heaviest write load (seat contention), so it gets its own primary and
+  # replica: a problem on one instance no longer stops the services on the other.
+  postgres-booking:
+    image: postgres:16-alpine
+    container_name: postgres-booking
+    restart: unless-stopped
+    networks: [backend]
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=5
+      - -c
+      - max_replication_slots=5
+      # Same value as postgres-main: the replica starts with 200 (db/replica/start-replica.sh).
+      - -c
+      - max_connections=200
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      REPLICATOR_PASSWORD: ${REPLICATOR_PASSWORD:-replicator}
+    volumes:
+      - postgres-booking-data:/var/lib/postgresql/data
+      - ./db/booking:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d booking"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  postgres-booking-replica:
+    image: postgres:16-alpine
+    container_name: postgres-booking-replica
+    restart: unless-stopped
+    networks: [backend]
+    entrypoint: ["/bin/sh", "/replica/start-replica.sh"]
+    environment:
+      PRIMARY_HOST: postgres-booking
+      REPLICATOR_PASSWORD: ${REPLICATOR_PASSWORD:-replicator}
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - postgres-booking-replica-data:/var/lib/postgresql/data
+      - ./db/replica:/replica:ro
+    depends_on:
+      postgres-booking:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -246,14 +307,17 @@ services:
     environment:
       PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
       TZ: Asia/Ho_Chi_Minh
-      # Where restore.sh writes: the current primary.
+      # Where restore.sh writes: the current primary of each instance.
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres-main}
+      BOOKING_DB_HOST: ${BOOKING_DB_HOST:-postgres-booking}
     volumes:
       - ./scripts:/scripts:ro
       - ./backups:/backups
-    # backup.sh prefers the replica but falls back to the primary, so only the primary is required.
+    # backup.sh prefers each replica but falls back to its primary, so only the primaries are required.
     depends_on:
       postgres-main:
+        condition: service_healthy
+      postgres-booking:
         condition: service_healthy
 
   # ---------- Monitoring ----------
@@ -323,6 +387,22 @@ services:
     environment:
       DATA_SOURCE_NAME: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@postgres-replica:5432/postgres?sslmode=disable
 
+  postgres-exporter-booking:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    container_name: postgres-exporter-booking
+    restart: unless-stopped
+    networks: [backend]
+    environment:
+      DATA_SOURCE_NAME: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@postgres-booking:5432/postgres?sslmode=disable
+
+  postgres-exporter-booking-replica:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    container_name: postgres-exporter-booking-replica
+    restart: unless-stopped
+    networks: [backend]
+    environment:
+      DATA_SOURCE_NAME: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@postgres-booking-replica:5432/postgres?sslmode=disable
+
   redis-exporter:
     image: oliver006/redis_exporter:v1.74.0-alpine
     container_name: redis-exporter
@@ -360,6 +440,8 @@ networks:
 volumes:
   postgres-main-data:
   postgres-replica-data:
+  postgres-booking-data:
+  postgres-booking-replica-data:
   rabbitmq-data:
   prometheus-data:
   grafana-data:

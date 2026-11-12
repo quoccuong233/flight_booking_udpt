@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useLocation, useParams } from 'react-router-dom';
 import { api } from '../api.js';
 import { CheckIcon, Steps, Ticket } from '../components.jsx';
 import { CANCEL_REASONS, formatMoney } from '../format.js';
@@ -47,10 +47,12 @@ function Result({ booking, flight }) {
 
 export default function CheckoutPage() {
   const { bookingId } = useParams();
+  // Set by VnpayReturnPage when the customer comes back from VNPay.
+  const { state: returned } = useLocation();
   const [booking, setBooking] = useState(null);
-  const [error, setError] = useState('');
+  const [error, setError] = useState(returned?.message ?? '');
   const [submitting, setSubmitting] = useState(false);
-  const [waiting, setWaiting] = useState(false);
+  const [waiting, setWaiting] = useState(Boolean(returned?.paid));
   const secondsLeft = useCountdown(booking?.holdExpiresAt);
   const flights = useFlights([booking?.flightId]);
   const flight = flights[booking?.flightId];
@@ -79,7 +81,12 @@ export default function CheckoutPage() {
 
     for (let attempt = 0; ; attempt += 1) {
       try {
-        await api('/payments', request);
+        const result = await api('/payments', request);
+        // VNPay: leave the site to pay; VNPay sends the browser back to /payment/vnpay-return.
+        if (result.payUrl) {
+          window.location.assign(result.payUrl);
+          return;
+        }
         setWaiting(true);
         return;
       } catch (err) {
@@ -138,9 +145,9 @@ export default function CheckoutPage() {
                 disabled={submitting || secondsLeft === 0}
                 onClick={pay}
               >
-                {submitting ? 'Đang thanh toán...' : 'Thanh toán'}
+                {submitting ? 'Đang chuyển tới cổng thanh toán...' : 'Thanh toán'}
               </button>
-              <p className="muted small pay-note">Vé được xác nhận ngay sau khi thanh toán.</p>
+              <p className="muted small pay-note">Thanh toán qua cổng VNPay. Vé được xác nhận ngay sau khi thanh toán.</p>
             </>
           )}
         </div>
